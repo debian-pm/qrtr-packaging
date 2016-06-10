@@ -1,3 +1,9 @@
+qrtr (0.0+0+56074bd5-2) jessie; urgency=medium
+
+  * debian: add qrtr systemd service script
+
+ -- Nicolas Dechesne <nicolas.dechesne@linaro.org>  Fri, 10 Jun 2016 13:56:07 +0200
+
 qrtr (0.0+0+56074bd5-1) jessie; urgency=low
 
   * Initial Release.
