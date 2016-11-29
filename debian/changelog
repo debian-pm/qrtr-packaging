@@ -1,3 +1,10 @@
+qrtr (0.0+0+9c85f35a-1) stretch; urgency=medium
+
+  * Makefile: add standard GNU makefiles directory variables
+  * debian: update debian/* to support multiarch
+
+ -- Nicolas Dechesne <nicolas.dechesne@linaro.org>  Tue, 29 Nov 2016 09:54:05 +0100
+
 qrtr (0.0+0+56074bd5-2) jessie; urgency=medium
 
   * debian: add qrtr systemd service script
