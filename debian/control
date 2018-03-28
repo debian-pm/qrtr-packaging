@@ -2,11 +2,11 @@ Source: qrtr
 Section: utils
 Priority: optional
 Maintainer: Nicolas Dechesne <nicolas.dechesne@linaro.org>
-Build-Depends: cdbs  (>= 0.4.93~), debhelper (>= 8.1.3)
-Standards-Version: 3.9.3
+Build-Depends: cdbs  (>= 0.4.93~), debhelper (>= 11)
+Standards-Version: 4.1.3
 Homepage: https://github.com/andersson/qrtr.git
-Vcs-Git: https://github.com/andersson/qrtr.git
-Vcs-Browser: https://github.com/andersson/qrtr.git
+Vcs-Git: git://github.com/debian-pm/qrtr-packaging.git
+Vcs-Browser: https://github.com/debian-pm/qrtr-packaging
 
 Package: qrtr
 Architecture: any
@@ -24,9 +24,8 @@ Description: QRTR library
 Package: libqrtr-dev
 Section: libdevel
 Architecture: any
-Depends:
- libqrtr1 (= ${binary:Version}),
- ${shlibs:Depends},
- ${misc:Depends}
+Depends: libqrtr1 (= ${binary:Version}),
+                  ${shlibs:Depends},
+                  ${misc:Depends}
 Description: QRTR development files
  QRTR development files.
