@@ -19,6 +19,8 @@ SFLAGS := -I$(shell $(CC) -print-file-name=include) -Wno-non-pointer-null
 $(proj)-cfg-srcs := \
 	src/cfg.c
 
+$(proj)-cfg-cflags := -Ilib
+
 $(proj)-ns-srcs := \
 	src/ns.c \
 	src/map.c \
@@ -26,12 +28,17 @@ $(proj)-ns-srcs := \
 	src/waiter.c \
 	src/util.c \
 
+$(proj)-ns-cflags := -Ilib
+
 $(proj)-lookup-srcs := \
 	src/lookup.c \
 	src/util.c \
 
+$(proj)-lookup-cflags := -Ilib
+
 lib$(proj).so-srcs := \
-	lib/libqrtr.c \
+	lib/qrtr.c \
+	lib/qmi.c
 
 lib$(proj).so-cflags := -fPIC -Isrc
 
@@ -80,7 +87,7 @@ $(call add-target-deps,$1)
 
 $1: $(call src_to_obj,$($1-srcs))
 	@echo "LD	$$@"
-	$$(CC) -o $$@ $$(filter %.o,$$^) $(LDFLAGS) -static
+	$$(CC) -o $$@ $$(filter %.o,$$^) $(LDFLAGS)
 
 $(DESTDIR)$(bindir)/$1: $1
 	@echo "INSTALL	$$<"

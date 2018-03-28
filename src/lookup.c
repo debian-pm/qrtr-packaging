@@ -1,6 +1,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <linux/qrtr.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +9,7 @@
 #include <errno.h>
 #include <err.h>
 
-#include "qrtr.h"
+#include "libqrtr.h"
 #include "util.h"
 #include "ns.h"
 
@@ -59,9 +60,18 @@ static const struct {
 	{ 41, 0, "RF radiated performance enhancement service" },
 	{ 42, 0, "Data system determination service" },
 	{ 43, 0, "Subsystem control service" },
+	{ 49, 0, "IPA control service" },
+	{ 51, 0, "CoreSight remote tracing service" },
+	{ 64, 0, "Service registry locator service" },
+	{ 66, 0, "Service registry notification service" },
+	{ 69, 0, "ATH10k WLAN firmware service" },
 	{ 224, 0, "Card Application Toolkit service (v1)" },
 	{ 225, 0, "Remote Management Service" },
 	{ 226, 0, "Open Mobile Alliance device management service" },
+	{ 312, 0, "QBT1000 Ultrasonic Fingerprint Sensor service" },
+	{ 769, 0, "SLIMbus control service" },
+	{ 771, 0, "Peripheral Access Control Manager service" },
+	{ 4097, 0, "DIAG service" },
 };
 
 static unsigned int read_num_le(const char *str, int *rcp)
@@ -81,9 +91,14 @@ static unsigned int read_num_le(const char *str, int *rcp)
 
 int main(int argc, char **argv)
 {
+	struct qrtr_ctrl_pkt pkt;
 	struct sockaddr_qrtr sq;
+	unsigned int instance;
+	unsigned int service;
+	unsigned int version;
+	unsigned int node;
+	unsigned int port;
 	socklen_t sl = sizeof(sq);
-	struct ns_pkt pkt;
 	struct timeval tv;
 	int sock;
 	int len;
@@ -96,9 +111,8 @@ int main(int argc, char **argv)
 	default:
 		rc = -1;
 		break;
-	case 4: pkt.query.ifilter = read_num_le(argv[3], &rc);
-	case 3: pkt.query.instance = read_num_le(argv[2], &rc);
-	case 2: pkt.query.service = read_num_le(argv[1], &rc);
+	case 3: pkt.server.instance = read_num_le(argv[2], &rc);
+	case 2: pkt.server.service = read_num_le(argv[1], &rc);
 	case 1: break;
 	}
 	if (rc)
@@ -112,12 +126,12 @@ int main(int argc, char **argv)
 	if (rc || sq.sq_family != AF_QIPCRTR || sl != sizeof(sq))
 		err(1, "getsockname()");
 
-	sq.sq_port = NS_PORT;
+	sq.sq_port = QRTR_PORT_CTRL;
 
 	tv.tv_sec = 1;
 	tv.tv_usec = 0;
 
-	pkt.type = cpu_to_le32(NS_PKT_QUERY);
+	pkt.cmd = cpu_to_le32(QRTR_TYPE_NEW_LOOKUP);
 
 	rc = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	if (rc)
@@ -127,38 +141,43 @@ int main(int argc, char **argv)
 	if (rc < 0)
 		err(1, "sendto()");
 
+	printf("  Service Version Instance Node  Port\n");
+
 	while ((len = recv(sock, &pkt, sizeof(pkt), 0)) > 0) {
-		unsigned int type = le32_to_cpu(pkt.type);
+		unsigned int type = le32_to_cpu(pkt.cmd);
 		const char *name = NULL;
 		unsigned int i;
 
-		if (len < sizeof(pkt) || type != NS_PKT_NOTICE) {
+		if (len < sizeof(pkt) || type != QRTR_TYPE_NEW_SERVER) {
 			warn("invalid/short packet");
 			continue;
 		}
 
-		if (pkt.notice.seq == 0)
+		if (!pkt.server.service && !pkt.server.instance &&
+		    !pkt.server.node && !pkt.server.port)
 			break;
 
-		pkt.notice.service = le32_to_cpu(pkt.notice.service);
-		pkt.notice.instance = le32_to_cpu(pkt.notice.instance);
-		pkt.notice.node = le32_to_cpu(pkt.notice.node);
-		pkt.notice.port = le32_to_cpu(pkt.notice.port);
+		service = le32_to_cpu(pkt.server.service);
+		version = le32_to_cpu(pkt.server.instance) & 0xff;
+		instance = le32_to_cpu(pkt.server.instance) >> 8;
+		node = le32_to_cpu(pkt.server.node);
+		port = le32_to_cpu(pkt.server.port);
 
 		for (i = 0; i < sizeof(common_names)/sizeof(common_names[0]); ++i) {
-			if (pkt.notice.service != common_names[i].service)
+			if (service != common_names[i].service)
 				continue;
-			if (pkt.notice.instance &&
-			   (pkt.notice.instance & common_names[i].ifilter) != common_names[i].ifilter)
+			if (instance &&
+			   (instance & common_names[i].ifilter) != common_names[i].ifilter)
 				continue;
 			name = common_names[i].name;
 		}
 
-		printf("[%d:%x]@[%d:%d] (%s)\n",
-				pkt.notice.service,
-				pkt.notice.instance,
-				pkt.notice.node,
-				pkt.notice.port,
+		printf("%9d %7d %8d %4d %5d %s\n",
+				service,
+				version,
+				instance,
+				node,
+				port,
 				name ? name : "<unknown>");
 	}
 

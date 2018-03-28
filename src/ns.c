@@ -1,77 +1,62 @@
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <linux/qrtr.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <err.h>
+#include <errno.h>
 
 #include "map.h"
 #include "hash.h"
 #include "waiter.h"
 #include "list.h"
-#include "container.h"
-#include "qrtr.h"
 #include "util.h"
 #include "ns.h"
 
-enum ctrl_pkt_cmd {
-	QRTR_CMD_HELLO		= 2,
-	QRTR_CMD_BYE		= 3,
-	QRTR_CMD_NEW_SERVER	= 4,
-	QRTR_CMD_DEL_SERVER	= 5,
-	QRTR_CMD_DEL_CLIENT	= 6,
-	QRTR_CMD_RESUME_TX	= 7,
-	QRTR_CMD_EXIT		= 8,
-	QRTR_CMD_PING		= 9,
-
-	_QRTR_CMD_CNT,
-	_QRTR_CMD_MAX = _QRTR_CMD_CNT - 1
-};
-
-struct ctrl_pkt {
-	__le32 cmd;
-
-	union {
-		struct {
-			__le32 service;
-			__le32 instance;
-			__le32 node;
-			__le32 port;
-		} server;
-
-		struct {
-			__le32 node;
-			__le32 port;
-		} client;
-	};
-} __attribute__((packed));
+#include "libqrtr.h"
 
 static const char *ctrl_pkt_strings[] = {
-	[QRTR_CMD_HELLO]	= "hello",
-	[QRTR_CMD_BYE]		= "bye",
-	[QRTR_CMD_NEW_SERVER]	= "new-server",
-	[QRTR_CMD_DEL_SERVER]	= "del-server",
-	[QRTR_CMD_DEL_CLIENT]	= "del-client",
-	[QRTR_CMD_RESUME_TX]	= "resume-tx",
-	[QRTR_CMD_EXIT]		= "exit",
-	[QRTR_CMD_PING]		= "ping",
+	[QRTR_TYPE_HELLO]	= "hello",
+	[QRTR_TYPE_BYE]		= "bye",
+	[QRTR_TYPE_NEW_SERVER]	= "new-server",
+	[QRTR_TYPE_DEL_SERVER]	= "del-server",
+	[QRTR_TYPE_DEL_CLIENT]	= "del-client",
+	[QRTR_TYPE_RESUME_TX]	= "resume-tx",
+	[QRTR_TYPE_EXIT]	= "exit",
+	[QRTR_TYPE_PING]	= "ping",
+	[QRTR_TYPE_NEW_LOOKUP]	= "new-lookup",
+	[QRTR_TYPE_DEL_LOOKUP]	= "del-lookup",
 };
 
-#define QRTR_CTRL_PORT ((unsigned int)-2)
-
 #define dprintf(...)
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 
 struct context {
-	int ctrl_sock;
-	int ns_sock;
+	int sock;
+
+	int local_node;
+
+	struct sockaddr_qrtr bcast_sq;
+
+	struct list lookups;
 };
 
 struct server_filter {
 	unsigned int service;
 	unsigned int instance;
 	unsigned int ifilter;
+};
+
+struct lookup {
+	unsigned int service;
+	unsigned int instance;
+
+	struct sockaddr_qrtr sq;
+	struct list_item li;
 };
 
 struct server {
@@ -84,7 +69,46 @@ struct server {
 	struct list_item qli;
 };
 
-static struct map servers;
+struct node {
+	unsigned int id;
+
+	struct map_item mi;
+	struct map services;
+};
+
+static struct map nodes;
+
+static void server_mi_free(struct map_item *mi);
+
+static struct node *node_get(unsigned int node_id)
+{
+	struct map_item *mi;
+	struct node *node;
+	int rc;
+
+	mi = map_get(&nodes, hash_u32(node_id));
+	if (mi)
+		return container_of(mi, struct node, mi);
+
+	node = calloc(1, sizeof(*node));
+	if (!node)
+		return NULL;
+
+	node->id = node_id;
+
+	rc = map_create(&node->services);
+	if (rc)
+		errx(1, "unable to create map");
+
+	rc = map_put(&nodes, hash_u32(node_id), &node->mi);
+	if (rc) {
+		map_destroy(&node->services);
+		free(node);
+		return NULL;
+	}
+
+	return node;
+}
 
 static int server_match(const struct server *srv, const struct server_filter *f)
 {
@@ -97,75 +121,133 @@ static int server_match(const struct server *srv, const struct server_filter *f)
 	return (srv->instance & ifilter) == f->instance;
 }
 
-static struct server *server_lookup(unsigned int node, unsigned int port)
-{
-	struct map_item *mi;
-	unsigned int key;
-
-	key = hash_u64(((uint64_t)node << 16) ^ port);
-	mi = map_get(&servers, key);
-	if (mi == NULL)
-		return NULL;
-
-	return container_of(mi, struct server, mi);
-}
-
 static int server_query(const struct server_filter *f, struct list *list)
 {
+	struct map_entry *node_me;
 	struct map_entry *me;
+	struct node *node;
 	int count = 0;
 
 	list_init(list);
-	map_for_each(&servers, me) {
-		struct server *srv;
+	map_for_each(&nodes, node_me) {
+		node = map_iter_data(node_me, struct node, mi);
 
-		srv = map_iter_data(me, struct server, mi);
-		if (!server_match(srv, f))
-			continue;
+		map_for_each(&node->services, me) {
+			struct server *srv;
 
-		list_append(list, &srv->qli);
-		++count;
+			srv = map_iter_data(me, struct server, mi);
+			if (!server_match(srv, f))
+				continue;
+
+			list_append(list, &srv->qli);
+			++count;
+		}
 	}
 
 	return count;
 }
 
-static int annouce_servers(int sock, struct sockaddr_qrtr *sq)
+static int service_announce_new(struct context *ctx,
+				struct sockaddr_qrtr *dest,
+				struct server *srv)
 {
-	struct map_entry *me;
-	struct ctrl_pkt cmsg;
-	struct server *srv;
+	struct qrtr_ctrl_pkt cmsg;
 	int rc;
 
-	map_for_each(&servers, me) {
+	dprintf("advertising new server [%d:%x]@[%d:%d]\n",
+		srv->service, srv->instance, srv->node, srv->port);
+
+	cmsg.cmd = cpu_to_le32(QRTR_TYPE_NEW_SERVER);
+	cmsg.server.service = cpu_to_le32(srv->service);
+	cmsg.server.instance = cpu_to_le32(srv->instance);
+	cmsg.server.node = cpu_to_le32(srv->node);
+	cmsg.server.port = cpu_to_le32(srv->port);
+
+	rc = sendto(ctx->sock, &cmsg, sizeof(cmsg), 0,
+		    (struct sockaddr *)dest, sizeof(*dest));
+	if (rc < 0)
+		warn("sendto()");
+
+	return rc;
+}
+
+static int service_announce_del(struct context *ctx,
+				struct sockaddr_qrtr *dest,
+				struct server *srv)
+{
+	struct qrtr_ctrl_pkt cmsg;
+	int rc;
+
+	dprintf("advertising removal of server [%d:%x]@[%d:%d]\n",
+		srv->service, srv->instance, srv->node, srv->port);
+
+	cmsg.cmd = cpu_to_le32(QRTR_TYPE_DEL_SERVER);
+	cmsg.server.service = cpu_to_le32(srv->service);
+	cmsg.server.instance = cpu_to_le32(srv->instance);
+	cmsg.server.node = cpu_to_le32(srv->node);
+	cmsg.server.port = cpu_to_le32(srv->port);
+
+	rc = sendto(ctx->sock, &cmsg, sizeof(cmsg), 0,
+		    (struct sockaddr *)dest, sizeof(*dest));
+	if (rc < 0)
+		warn("sendto()");
+
+	return rc;
+}
+
+static int lookup_notify(struct context *ctx, struct sockaddr_qrtr *to,
+			 struct server *srv, bool new)
+{
+	struct qrtr_ctrl_pkt pkt = {};
+	int rc;
+
+	pkt.cmd = new ? QRTR_TYPE_NEW_SERVER : QRTR_TYPE_DEL_SERVER;
+	if (srv) {
+		pkt.server.service = cpu_to_le32(srv->service);
+		pkt.server.instance = cpu_to_le32(srv->instance);
+		pkt.server.node = cpu_to_le32(srv->node);
+		pkt.server.port = cpu_to_le32(srv->port);
+	}
+
+	rc = sendto(ctx->sock, &pkt, sizeof(pkt), 0,
+		    (struct sockaddr *)to, sizeof(*to));
+	if (rc < 0)
+		warn("send lookup result failed");
+	return rc;
+}
+
+static int annouce_servers(struct context *ctx, struct sockaddr_qrtr *sq)
+{
+	struct map_entry *me;
+	struct server *srv;
+	struct node *node;
+	int rc;
+
+	node = node_get(ctx->local_node);
+	if (!node)
+		return 0;
+
+	map_for_each(&node->services, me) {
 		srv = map_iter_data(me, struct server, mi);
-		if (srv->node != 1)
-			continue;
 
-		dprintf("advertising server [%d:%x]@[%d:%d]\n", srv->service, srv->instance, srv->node, srv->port);
-
-		cmsg.cmd = cpu_to_le32(QRTR_CMD_NEW_SERVER);
-		cmsg.server.service = cpu_to_le32(srv->service);
-		cmsg.server.instance = cpu_to_le32(srv->instance);
-		cmsg.server.node = cpu_to_le32(srv->node);
-		cmsg.server.port = cpu_to_le32(srv->port);
-		rc = sendto(sock, &cmsg, sizeof(cmsg), 0, (void *)sq, sizeof(*sq));
-		if (rc < 0) {
-			warn("sendto()");
+		rc = service_announce_new(ctx, sq, srv);
+		if (rc < 0)
 			return rc;
-		}
 	}
 
 	return 0;
 }
 
 static struct server *server_add(unsigned int service, unsigned int instance,
-	unsigned int node, unsigned int port)
+	unsigned int node_id, unsigned int port)
 {
 	struct map_item *mi;
 	struct server *srv;
-	unsigned int key;
+	struct node *node;
 	int rc;
+
+	if (!service || !port)
+		return NULL;
 
 	srv = calloc(1, sizeof(*srv));
 	if (srv == NULL)
@@ -173,15 +255,16 @@ static struct server *server_add(unsigned int service, unsigned int instance,
 
 	srv->service = service;
 	srv->instance = instance;
-	srv->node = node;
+	srv->node = node_id;
 	srv->port = port;
 
-	key = hash_u64(((uint64_t)srv->node << 16) ^ srv->port);
-	rc = map_reput(&servers, key, &srv->mi, &mi);
-	if (rc) {
-		free(srv);
-		return NULL;
-	}
+	node = node_get(node_id);
+	if (!node)
+		goto err;
+
+	rc = map_reput(&node->services, hash_u32(port), &srv->mi, &mi);
+	if (rc)
+		goto err;
 
 	dprintf("add server [%d:%x]@[%d:%d]\n", srv->service, srv->instance,
 			srv->node, srv->port);
@@ -192,26 +275,302 @@ static struct server *server_add(unsigned int service, unsigned int instance,
 	}
 
 	return srv;
+
+err:
+	free(srv);
+	return NULL;
 }
 
-static struct server *server_del(unsigned int node, unsigned int port)
+static int server_del(struct context *ctx, struct node *node, unsigned int port)
 {
+	struct lookup *lookup;
+	struct list_item *li;
+	struct map_item *mi;
 	struct server *srv;
 
-	srv = server_lookup(node, port);
-	if (srv != NULL)
-		map_remove(&servers, srv->mi.key);
+	mi = map_get(&node->services, hash_u32(port));
+	if (!mi)
+		return -ENOENT;
 
-	return srv;
+	srv = container_of(mi, struct server, mi);
+	map_remove(&node->services, srv->mi.key);
+
+	/* Broadcast the removal of local services */
+	if (srv->node == ctx->local_node)
+		service_announce_del(ctx, &ctx->bcast_sq, srv);
+
+	/* Announce the service's disappearance to observers */
+	list_for_each(&ctx->lookups, li) {
+		lookup = container_of(li, struct lookup, li);
+		if (lookup->service && lookup->service != srv->service)
+			continue;
+		if (lookup->instance && lookup->instance != srv->instance)
+			continue;
+
+		lookup_notify(ctx, &lookup->sq, srv, false);
+	}
+
+	free(srv);
+
+	return 0;
+}
+
+static int ctrl_cmd_hello(struct context *ctx, struct sockaddr_qrtr *sq,
+			  const void *buf, size_t len)
+{
+	int rc;
+
+	rc = sendto(ctx->sock, buf, len, 0, (void *)sq, sizeof(*sq));
+	if (rc > 0)
+		rc = annouce_servers(ctx, sq);
+
+	return rc;
+}
+
+static int ctrl_cmd_bye(struct context *ctx, struct sockaddr_qrtr *from)
+{
+	struct qrtr_ctrl_pkt pkt;
+	struct sockaddr_qrtr sq;
+	struct node *local_node;
+	struct map_entry *me;
+	struct server *srv;
+	struct node *node;
+	int rc;
+
+	node = node_get(from->sq_node);
+	if (!node)
+		return 0;
+
+	map_for_each(&node->services, me) {
+		srv = map_iter_data(me, struct server, mi);
+
+		server_del(ctx, node, srv->port);
+	}
+
+	/* Advertise the removal of this client to all local services */
+	local_node = node_get(ctx->local_node);
+	if (!local_node)
+		return 0;
+
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.cmd = QRTR_TYPE_BYE;
+	pkt.client.node = from->sq_node;
+
+	map_for_each(&local_node->services, me) {
+		srv = map_iter_data(me, struct server, mi);
+
+		sq.sq_family = AF_QIPCRTR;
+		sq.sq_node = srv->node;
+		sq.sq_port = srv->port;
+
+		rc = sendto(ctx->sock, &pkt, sizeof(pkt), 0,
+				(struct sockaddr *)&sq, sizeof(sq));
+		if (rc < 0)
+			warn("bye propagation failed");
+	}
+
+	return 0;
+}
+
+static int ctrl_cmd_del_client(struct context *ctx, struct sockaddr_qrtr *from,
+			       unsigned node_id, unsigned port)
+{
+	struct qrtr_ctrl_pkt pkt;
+	struct sockaddr_qrtr sq;
+	struct node *local_node;
+	struct list_item *tmp;
+	struct lookup *lookup;
+	struct list_item *li;
+	struct map_entry *me;
+	struct server *srv;
+	struct node *node;
+	int rc;
+
+	/* Don't accept spoofed messages */
+	if (from->sq_node != node_id)
+		return -EINVAL;
+
+	/* Local DEL_CLIENT messages comes from the port being closed */
+	if (from->sq_node == ctx->local_node && from->sq_port != port)
+		return -EINVAL;
+
+	/* Remove any lookups by this client */
+	list_for_each_safe(&ctx->lookups, li, tmp) {
+		lookup = container_of(li, struct lookup, li);
+		if (lookup->sq.sq_node != node_id)
+			continue;
+		if (lookup->sq.sq_port != port)
+			continue;
+
+		list_remove(&ctx->lookups, &lookup->li);
+		free(lookup);
+	}
+
+	/* Remove the server belonging to this port*/
+	node = node_get(node_id);
+	if (node)
+		server_del(ctx, node, port);
+
+	/* Advertise the removal of this client to all local services */
+	local_node = node_get(ctx->local_node);
+	if (!local_node)
+		return 0;
+
+	pkt.cmd = QRTR_TYPE_DEL_CLIENT;
+	pkt.client.node = node_id;
+	pkt.client.port = port;
+
+	map_for_each(&local_node->services, me) {
+		srv = map_iter_data(me, struct server, mi);
+
+		sq.sq_family = AF_QIPCRTR;
+		sq.sq_node = srv->node;
+		sq.sq_port = srv->port;
+
+		rc = sendto(ctx->sock, &pkt, sizeof(pkt), 0,
+				(struct sockaddr *)&sq, sizeof(sq));
+		if (rc < 0)
+			warn("del_client propagation failed");
+	}
+
+	return 0;
+}
+
+static int ctrl_cmd_new_server(struct context *ctx, struct sockaddr_qrtr *from,
+			       unsigned int service, unsigned int instance,
+			       unsigned int node_id, unsigned int port)
+{
+	struct lookup *lookup;
+	struct list_item *li;
+	struct server *srv;
+	int rc = 0;
+
+	/* Ignore specified node and port for local servers*/
+	if (from->sq_node == ctx->local_node) {
+		node_id = from->sq_node;
+		port = from->sq_port;
+	}
+
+	/* Don't accept spoofed messages */
+	if (from->sq_node != node_id)
+		return -EINVAL;
+
+	srv = server_add(service, instance, node_id, port);
+	if (!srv)
+		return -EINVAL;
+
+	if (srv->node == ctx->local_node)
+		rc = service_announce_new(ctx, &ctx->bcast_sq, srv);
+
+	list_for_each(&ctx->lookups, li) {
+		lookup = container_of(li, struct lookup, li);
+		if (lookup->service && lookup->service != service)
+			continue;
+		if (lookup->instance && lookup->instance != instance)
+			continue;
+
+		lookup_notify(ctx, &lookup->sq, srv, true);
+	}
+
+	return rc;
+}
+
+static int ctrl_cmd_del_server(struct context *ctx, struct sockaddr_qrtr *from,
+			       unsigned int service, unsigned int instance,
+			       unsigned int node_id, unsigned int port)
+{
+	struct node *node;
+
+	/* Ignore specified node and port for local servers*/
+	if (from->sq_node == ctx->local_node) {
+		node_id = from->sq_node;
+		port = from->sq_port;
+	}
+
+	/* Don't accept spoofed messages */
+	if (from->sq_node != node_id)
+		return -EINVAL;
+
+	/* Local servers may only unregister themselves */
+	if (from->sq_node == ctx->local_node && from->sq_port != port)
+		return -EINVAL;
+
+	node = node_get(node_id);
+	if (!node)
+		return -ENOENT;
+
+	return server_del(ctx, node, port);
+}
+
+static int ctrl_cmd_new_lookup(struct context *ctx, struct sockaddr_qrtr *from,
+			       unsigned int service, unsigned int instance)
+{
+	struct server_filter filter;
+	struct list reply_list;
+	struct lookup *lookup;
+	struct list_item *li;
+	struct server *srv;
+
+	/* Accept only local observers */
+	if (from->sq_node != ctx->local_node)
+		return -EINVAL;
+
+	lookup = calloc(1, sizeof(*lookup));
+	if (!lookup)
+		return -EINVAL;
+
+	lookup->sq = *from;
+	lookup->service = service;
+	lookup->instance = instance;
+	list_append(&ctx->lookups, &lookup->li);
+
+	memset(&filter, 0, sizeof(filter));
+	filter.service = service;
+	filter.instance = instance;
+
+	server_query(&filter, &reply_list);
+	list_for_each(&reply_list, li) {
+		srv = container_of(li, struct server, qli);
+
+		lookup_notify(ctx, from, srv, true);
+	}
+
+	lookup_notify(ctx, from, NULL, true);
+
+	return 0;
+}
+
+static int ctrl_cmd_del_lookup(struct context *ctx, struct sockaddr_qrtr *from,
+			       unsigned int service, unsigned int instance)
+{
+	struct lookup *lookup;
+	struct list_item *tmp;
+	struct list_item *li;
+
+	list_for_each_safe(&ctx->lookups, li, tmp) {
+		lookup = container_of(li, struct lookup, li);
+		if (lookup->sq.sq_node != from->sq_node)
+			continue;
+		if (lookup->sq.sq_port != from->sq_port)
+			continue;
+		if (lookup->service != service)
+			continue;
+		if (lookup->instance && lookup->instance != instance)
+			continue;
+
+		list_remove(&ctx->lookups, &lookup->li);
+		free(lookup);
+	}
+
+	return 0;
 }
 
 static void ctrl_port_fn(void *vcontext, struct waiter_ticket *tkt)
 {
 	struct context *ctx = vcontext;
 	struct sockaddr_qrtr sq;
-	int sock = ctx->ctrl_sock;
-	struct ctrl_pkt *msg;
-	struct server *srv;
+	int sock = ctx->sock;
+	struct qrtr_ctrl_pkt *msg;
 	unsigned int cmd;
 	char buf[4096];
 	socklen_t sl;
@@ -223,244 +582,86 @@ static void ctrl_port_fn(void *vcontext, struct waiter_ticket *tkt)
 	if (len <= 0) {
 		warn("recvfrom()");
 		close(sock);
-		ctx->ctrl_sock = -1;
+		ctx->sock = -1;
 		goto out;
 	}
 	msg = (void *)buf;
 
-	dprintf("new packet; from: %d:%d\n", sq.sq_node, sq.sq_port);
-
 	if (len < 4) {
-		warn("short packet");
+		warnx("short packet from %d:%d", sq.sq_node, sq.sq_port);
 		goto out;
 	}
 
 	cmd = le32_to_cpu(msg->cmd);
-	if (cmd <= _QRTR_CMD_MAX && ctrl_pkt_strings[cmd])
-		dprintf("packet type: %s\n", ctrl_pkt_strings[cmd]);
+	if (cmd < ARRAY_SIZE(ctrl_pkt_strings) && ctrl_pkt_strings[cmd])
+		dprintf("%s from %d:%d\n", ctrl_pkt_strings[cmd], sq.sq_node, sq.sq_port);
 	else
-		dprintf("packet type: UNK (%08x)\n", cmd);
+		dprintf("UNK (%08x) from %d:%d\n", cmd, sq.sq_node, sq.sq_port);
 
 	rc = 0;
 	switch (cmd) {
-	case QRTR_CMD_HELLO:
-		rc = sendto(sock, buf, len, 0, (void *)&sq, sizeof(sq));
-		if (rc > 0)
-			rc = annouce_servers(sock, &sq);
+	case QRTR_TYPE_HELLO:
+		rc = ctrl_cmd_hello(ctx, &sq, buf, len);
 		break;
-	case QRTR_CMD_EXIT:
-	case QRTR_CMD_PING:
-	case QRTR_CMD_BYE:
-	case QRTR_CMD_RESUME_TX:
-	case QRTR_CMD_DEL_CLIENT:
+	case QRTR_TYPE_BYE:
+		rc = ctrl_cmd_bye(ctx, &sq);
 		break;
-	case QRTR_CMD_NEW_SERVER:
-		server_add(le32_to_cpu(msg->server.service),
-				le32_to_cpu(msg->server.instance),
-				le32_to_cpu(msg->server.node),
-				le32_to_cpu(msg->server.port));
+	case QRTR_TYPE_DEL_CLIENT:
+		rc = ctrl_cmd_del_client(ctx, &sq,
+					 le32_to_cpu(msg->client.node),
+					 le32_to_cpu(msg->client.port));
 		break;
-	case QRTR_CMD_DEL_SERVER:
-		srv = server_del(le32_to_cpu(msg->server.node),
-				le32_to_cpu(msg->server.port));
-		if (srv)
-			free(srv);
+	case QRTR_TYPE_NEW_SERVER:
+		rc = ctrl_cmd_new_server(ctx, &sq,
+					 le32_to_cpu(msg->server.service),
+					 le32_to_cpu(msg->server.instance),
+					 le32_to_cpu(msg->server.node),
+					 le32_to_cpu(msg->server.port));
+		break;
+	case QRTR_TYPE_DEL_SERVER:
+		rc = ctrl_cmd_del_server(ctx, &sq,
+					 le32_to_cpu(msg->server.service),
+					 le32_to_cpu(msg->server.instance),
+					 le32_to_cpu(msg->server.node),
+					 le32_to_cpu(msg->server.port));
+		break;
+	case QRTR_TYPE_EXIT:
+	case QRTR_TYPE_PING:
+	case QRTR_TYPE_RESUME_TX:
+		break;
+	case QRTR_TYPE_NEW_LOOKUP:
+		rc = ctrl_cmd_new_lookup(ctx, &sq,
+					 le32_to_cpu(msg->server.service),
+					 le32_to_cpu(msg->server.instance));
+		break;
+	case QRTR_TYPE_DEL_LOOKUP:
+		rc = ctrl_cmd_del_lookup(ctx, &sq,
+					 le32_to_cpu(msg->server.service),
+					 le32_to_cpu(msg->server.instance));
 		break;
 	}
 
 	if (rc < 0)
-		warn("failed while handling packet");
+		warnx("failed while handling packet from %d:%d",
+		      sq.sq_node, sq.sq_port);
 out:
 	waiter_ticket_clear(tkt);
 }
 
-static int say_hello(int sock)
+static int say_hello(struct context *ctx)
 {
-	struct sockaddr_qrtr sq;
-	struct ctrl_pkt pkt;
+	struct qrtr_ctrl_pkt pkt;
 	int rc;
 
-	sq.sq_family = AF_QIPCRTR;
-	sq.sq_node = QRTRADDR_ANY;
-	sq.sq_port = QRTR_CTRL_PORT;
-
 	memset(&pkt, 0, sizeof(pkt));
-	pkt.cmd = cpu_to_le32(QRTR_CMD_HELLO);
+	pkt.cmd = cpu_to_le32(QRTR_TYPE_HELLO);
 
-	rc = sendto(sock, &pkt, sizeof(pkt), 0, (void *)&sq, sizeof(sq));
+	rc = sendto(ctx->sock, &pkt, sizeof(pkt), 0,
+		    (struct sockaddr *)&ctx->bcast_sq, sizeof(ctx->bcast_sq));
 	if (rc < 0)
 		return rc;
 
 	return 0;
-}
-
-static int announce_reset(int sock)
-{
-	struct sockaddr_qrtr sq;
-	struct ns_pkt pkt;
-	int rc;
-
-	sq.sq_family = AF_QIPCRTR;
-	sq.sq_node = QRTRADDR_ANY;
-	sq.sq_port = NS_PORT;
-
-	memset(&pkt, 0, sizeof(pkt));
-	pkt.type = cpu_to_le32(NS_PKT_RESET);
-
-	rc = sendto(sock, &pkt, sizeof(pkt), 0, (void *)&sq, sizeof(sq));
-	if (rc < 0)
-		return rc;
-
-	return 0;
-
-}
-
-static void ns_port_fn(void *vcontext, struct waiter_ticket *tkt)
-{
-	struct context *ctx = vcontext;
-	struct sockaddr_qrtr sq;
-	int sock = ctx->ns_sock;
-	struct ctrl_pkt cmsg;
-	struct server *srv;
-	struct ns_pkt *msg;
-	char buf[4096];
-	socklen_t sl;
-	ssize_t len;
-	int rc;
-
-	sl = sizeof(sq);
-	len = recvfrom(sock, buf, sizeof(buf), 0, (void *)&sq, &sl);
-	if (len <= 0) {
-		warn("recvfrom()");
-		close(sock);
-		ctx->ns_sock = -1;
-		goto out;
-	}
-	msg = (void *)buf;
-
-	dprintf("new packet; from: %d:%d\n", sq.sq_node, sq.sq_port);
-
-	if (len < 4) {
-		warn("short packet");
-		goto out;
-	}
-
-	rc = 0;
-	switch (le32_to_cpu(msg->type)) {
-	case NS_PKT_PUBLISH:
-		srv = server_add(le32_to_cpu(msg->publish.service),
-				le32_to_cpu(msg->publish.instance),
-				sq.sq_node, sq.sq_port);
-		if (srv == NULL) {
-			warn("unable to add server");
-			break;
-		}
-		cmsg.cmd = cpu_to_le32(QRTR_CMD_NEW_SERVER);
-		cmsg.server.service = cpu_to_le32(srv->service);
-		cmsg.server.instance = cpu_to_le32(srv->instance);
-		cmsg.server.node = cpu_to_le32(srv->node);
-		cmsg.server.port = cpu_to_le32(srv->port);
-		sq.sq_node = QRTRADDR_ANY;
-		sq.sq_port = QRTR_CTRL_PORT;
-		rc = sendto(ctx->ctrl_sock, &cmsg, sizeof(cmsg), 0, (void *)&sq, sizeof(sq));
-		if (rc < 0)
-			warn("sendto()");
-		break;
-	case NS_PKT_BYE:
-		srv = server_del(sq.sq_node, sq.sq_port);
-		if (srv == NULL) {
-			warn("bye from to unregistered server");
-			break;
-		}
-		cmsg.cmd = cpu_to_le32(QRTR_CMD_DEL_SERVER);
-		cmsg.server.service = cpu_to_le32(srv->service);
-		cmsg.server.instance = cpu_to_le32(srv->instance);
-		cmsg.server.node = cpu_to_le32(srv->node);
-		cmsg.server.port = cpu_to_le32(srv->port);
-		free(srv);
-		sq.sq_node = QRTRADDR_ANY;
-		sq.sq_port = QRTR_CTRL_PORT;
-		rc = sendto(ctx->ctrl_sock, &cmsg, sizeof(cmsg), 0, (void *)&sq, sizeof(sq));
-		if (rc < 0)
-			warn("sendto()");
-		break;
-	case NS_PKT_QUERY: {
-		struct server_filter filter = {
-			le32_to_cpu(msg->query.service),
-			le32_to_cpu(msg->query.instance),
-			le32_to_cpu(msg->query.ifilter),
-		};
-		struct list reply_list;
-		struct list_item *li;
-		struct ns_pkt opkt;
-		int seq;
-
-		seq = server_query(&filter, &reply_list);
-
-		memset(&opkt, 0, sizeof(opkt));
-		opkt.type = NS_PKT_NOTICE;
-		list_for_each(&reply_list, li) {
-			struct server *srv = container_of(li, struct server, qli);
-
-			opkt.notice.seq = cpu_to_le32(seq);
-			opkt.notice.service = cpu_to_le32(srv->service);
-			opkt.notice.instance = cpu_to_le32(srv->instance);
-			opkt.notice.node = cpu_to_le32(srv->node);
-			opkt.notice.port = cpu_to_le32(srv->port);
-			rc = sendto(sock, &opkt, sizeof(opkt),
-					0, (void *)&sq, sizeof(sq));
-			if (rc < 0) {
-				warn("sendto()");
-				break;
-			}
-			--seq;
-		}
-		if (rc < 0)
-			break;
-
-		memset(&opkt, 0, sizeof(opkt));
-		opkt.type = NS_PKT_NOTICE;
-		rc = sendto(sock, &opkt, sizeof(opkt), 0, (void *)&sq, sizeof(sq));
-		if (rc < 0)
-			warn("sendto()");
-		break;
-	}
-	case NS_PKT_NOTICE:
-		break;
-	}
-
-out:
-	waiter_ticket_clear(tkt);
-}
-
-static int qrtr_socket(int port)
-{
-	struct sockaddr_qrtr sq;
-	socklen_t sl = sizeof(sq);
-	int sock;
-	int rc;
-
-	sock = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
-	if (sock < 0) {
-		warn("sock(AF_QIPCRTR)");
-		return -1;
-	}
-
-	rc = getsockname(sock, (void*)&sq, &sl);
-	if (rc < 0 || sq.sq_node == -1) {
-		warn("getsockname()");
-		return -1;
-	}
-	sq.sq_port = port;
-
-	rc = bind(sock, (void *)&sq, sizeof(sq));
-	if (rc < 0) {
-		warn("bind(sock)");
-		close(sock);
-		return -1;
-	}
-
-	return sock;
 }
 
 static void server_mi_free(struct map_item *mi)
@@ -468,57 +669,74 @@ static void server_mi_free(struct map_item *mi)
 	free(container_of(mi, struct server, mi));
 }
 
+static void node_mi_free(struct map_item *mi)
+{
+	struct node *node = container_of(mi, struct node, mi);
+
+	map_clear(&node->services, server_mi_free);
+	map_destroy(&node->services);
+
+	free(node);
+}
+
 int main(int argc, char **argv)
 {
 	struct waiter_ticket *tkt;
+	struct sockaddr_qrtr sq;
 	struct context ctx;
 	struct waiter *w;
+	socklen_t sl = sizeof(sq);
 	int rc;
 
 	w = waiter_create();
 	if (w == NULL)
 		errx(1, "unable to create waiter");
 
-	rc = map_create(&servers);
+	list_init(&ctx.lookups);
+
+	rc = map_create(&nodes);
 	if (rc)
-		errx(1, "unable to create map");
+		errx(1, "unable to create node map");
 
-	ctx.ctrl_sock = qrtr_socket(QRTR_CTRL_PORT);
-	if (ctx.ctrl_sock < 0)
-		errx(1, "unable to create control socket");
+	ctx.sock = socket(AF_QIPCRTR, SOCK_DGRAM, 0);
+	if (ctx.sock < 0)
+		err(1, "unable to create control socket");
 
-	ctx.ns_sock = qrtr_socket(NS_PORT);
-	if (ctx.ns_sock < 0)
-		errx(1, "unable to create nameserver socket");
+	rc = getsockname(ctx.sock, (void*)&sq, &sl);
+	if (rc < 0)
+		err(1, "getsockname()");
+	sq.sq_port = QRTR_PORT_CTRL;
+	ctx.local_node = sq.sq_node;
 
-	rc = say_hello(ctx.ctrl_sock);
+	rc = bind(ctx.sock, (void *)&sq, sizeof(sq));
+	if (rc < 0)
+		err(1, "bind control socket");
+
+	ctx.bcast_sq.sq_family = AF_QIPCRTR;
+	ctx.bcast_sq.sq_node = QRTR_NODE_BCAST;
+	ctx.bcast_sq.sq_port = QRTR_PORT_CTRL;
+
+	rc = say_hello(&ctx);
 	if (rc)
 		err(1, "unable to say hello");
 
-	rc = announce_reset(ctx.ns_sock);
-	if (rc)
-		err(1, "unable to announce reset");
-
 	if (fork() != 0) {
-		close(ctx.ctrl_sock);
-		close(ctx.ns_sock);
+		close(ctx.sock);
 		exit(0);
 	}
 
-	tkt = waiter_add_fd(w, ctx.ctrl_sock);
+	tkt = waiter_add_fd(w, ctx.sock);
 	waiter_ticket_callback(tkt, ctrl_port_fn, &ctx);
 
-	tkt = waiter_add_fd(w, ctx.ns_sock);
-	waiter_ticket_callback(tkt, ns_port_fn, &ctx);
-
-	while (ctx.ctrl_sock >= 0 && ctx.ns_sock >= 0)
+	while (ctx.sock >= 0)
 		waiter_wait(w);
 
 	puts("exiting cleanly");
 
 	waiter_destroy(w);
-	map_clear(&servers, server_mi_free);
-	map_destroy(&servers);
+
+	map_clear(&nodes, node_mi_free);
+	map_destroy(&nodes);
 
 	return 0;
 }
