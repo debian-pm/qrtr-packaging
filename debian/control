@@ -25,7 +25,6 @@ Package: libqrtr-dev
 Section: libdevel
 Architecture: any
 Depends: libqrtr1 (= ${binary:Version}),
-                  ${shlibs:Depends},
                   ${misc:Depends}
 Description: QRTR development files
  QRTR development files.
